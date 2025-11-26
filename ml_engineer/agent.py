@@ -1,65 +1,128 @@
-STATE_TASK          = "task_description"
-STATE_CODE          = "last_code"
-STATE_STDOUT        = "last_stdout"
-STATE_STDERR        = "last_stderr"
-STATE_EXEC_STATUS   = "last_execution_status"  # "OK" / "FAILED"
-STATE_FEEDBACK      = "last_feedback"          # critique from judge
+STATE_FEEDBACK = "last_feedback"  # keep only what we actually use
 
-from google.adk.code_executors import UnsafeLocalCodeExecutor
-from google.adk.agents import LlmAgent
+import io
+import contextlib
+import traceback
+
+from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.models import Gemini
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.exit_loop_tool import exit_loop
-from google.adk.agents import LoopAgent
 
-code_executor = UnsafeLocalCodeExecutor(
-    # keep non-stateful for now
-    stateful=False,
-    # optional: tighten retries to 0 or 1 to avoid repeated runs inside a single attempt
-    error_retry_attempts=0,
-)
+def run_python(code: str) -> str:
+    """
+    Execute arbitrary Python code in the current venv and return
+    status + captured stdout/stderr as a single string.
+
+    WARNING: This is intentionally unsafe, for local dev use only.
+    """
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    ns = {}
+    status = "OK"
+
+    try:
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            compiled = compile(code, "<ml_engineer>", "exec")
+            exec(compiled, ns, ns)
+    except Exception as e:
+        status = f"ERROR: {type(e).__name__}: {e}"
+        traceback.print_exc(file=buf_err)
+
+    stdout = buf_out.getvalue()
+    stderr = buf_err.getvalue()
+
+    return (
+        f"STATUS: {status}\n\n"
+        f"STDOUT:\n{stdout}\n\n"
+        f"STDERR:\n{stderr}"
+    )
+
+# --- Local Python executor as a tool ----------------------------------------
+
+
+def run_python(code: str) -> str:
+    """
+    Execute arbitrary Python code in the current venv and return
+    status + captured stdout/stderr as a single string.
+
+    WARNING: This is intentionally unsafe, for local dev use only.
+    """
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    ns = {}
+    status = "OK"
+
+    try:
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            compiled = compile(code, "<ml_engineer>", "exec")
+            exec(compiled, ns, ns)
+    except Exception as e:
+        status = f"ERROR: {type(e).__name__}: {e}"
+        traceback.print_exc(file=buf_err)
+
+    stdout = buf_out.getvalue()
+    stderr = buf_err.getvalue()
+
+    return (
+        f"STATUS: {status}\n\n"
+        f"STDOUT:\n{stdout}\n\n"
+        f"STDERR:\n{stderr}"
+    )
+
+
+# --- ML Engineer agent ------------------------------------------------------
+
 
 ml_engineer = LlmAgent(
     name="ML_Engineer",
-    model=Gemini(model="gemini-2.5-flash-lite"),  # or whatever you use
-    code_executor=code_executor,
-    tools=[],
+    model=Gemini(model="gemini-2.5-flash-lite"),
+    # ADK in your version accepts plain callables as tools
+    tools=[run_python],
     instruction=f"""
-You are an ML Engineer. Your job is to implement and run Python code for a single task.
+You are an ML Engineer. Your job is to implement and run Python code
+for a single task.
 
-You are given:
-- Task description: {{{{{ {STATE_TASK} }}}}}
-- Judge feedback from previous attempt (may be empty): {{{{{ {STATE_FEEDBACK} }}}}}
+Task description (from the user):
+{{+ user_input +}}
 
-Rules:
+Judge feedback from previous attempt (may be empty):
+{{+ {STATE_FEEDBACK} +}}
 
-1. Work on **this task only**. Do NOT invent new tasks or run extra experiments
-   beyond what is necessary to satisfy the task.
-2. Keep each attempt small and fast:
-   - If you need datasets, use small toy datasets from scikit-learn / torchvision.
-   - Limit epochs, sample subsets; no huge long-running training.
-3. In each attempt:
-   a) Briefly state your plan in 1–2 sentences.
-   b) Write the full Python code in a single code block *meant for execution*.
-   c) Use the local code executor tool to run your code.
-   d) Ensure the code **prints the key result** that proves you attempted the task
-      (e.g. print the sum, accuracy, loss, or model path).
-4. After running, summarize whether execution succeeded or failed.
+For THIS task only, you must perform at most one small experiment per attempt.
 
-Important success criteria for you:
+In each attempt you MUST:
 
-- If task is "sum A and B", you must actually compute A+B, not something else.
-- If task is "train model on MNIST", do not silently switch to Iris, digits, etc.
-- If code errors, your next attempt should fix the error; use feedback from judge.
+1. Briefly restate your understanding and plan in 1–2 sentences.
 
-When you call the code executor, the execution result (stdout, stderr, status) will be
-stored into shared state by the executor, and will be used by the judge.
+2. Prepare ONE complete Python script that solves the task end-to-end.
+   - Use small / toy datasets (scikit-learn, torchvision, etc.).
+   - Keep training short (few epochs, small subsets).
+   - Ensure the script prints the key result(s) needed to verify the task:
+     e.g. a sum, an accuracy, a path to a saved model, etc.
 
-Never run more than ONE major training / job per attempt.
+3. Call the `run_python` tool EXACTLY ONCE, passing your full script
+   as the `code` argument.
+   - Do NOT execute code in any other way.
+   - Do NOT call `run_python` multiple times in a single attempt.
+
+4. After the tool result comes back, read its STATUS / STDOUT / STDERR
+   and write a short summary of what happened (success or failure)
+   and what was printed.
+
+If the previous attempt failed or the judge gave hints, use that feedback
+to improve this attempt.
+
+You MUST NOT:
+- Start unrelated experiments or train many different models.
+- Download large datasets or train huge networks.
 """,
-    # optional: if you want, you can use output_key to stash a human-readable summary
+    # We'll stash your human-readable summary for the judge to reuse as feedback
     output_key=STATE_FEEDBACK,
 )
+
+
+# --- Judge agent ------------------------------------------------------------
 
 
 judge = LlmAgent(
@@ -69,50 +132,57 @@ judge = LlmAgent(
     instruction=f"""
 You are a strict judge for an ML coding task.
 
-You are given:
-- Task description: {{{{{ {STATE_TASK} }}}}}
-- Most recent engineer attempt (code + commentary): {{{{{ {STATE_CODE} }}}}}
-- Execution status: {{{{{ {STATE_EXEC_STATUS} }}}}}
-- Execution stdout: {{{{{ {STATE_STDOUT} }}}}}
-- Execution stderr (if any): {{{{{ {STATE_STDERR} }}}}}
+Available context:
+- Task description: {{+ user_input +}}
+- Engineer's latest message (plan + `run_python` tool call + summary).
+- The `run_python` tool result, which includes STATUS, STDOUT and STDERR.
+- Your previous feedback (if any): {{+ {STATE_FEEDBACK} +}}
 
 Your job:
 
-1. Decide if the **task is formally satisfied**, ignoring ML quality.
-   - It's OK if model accuracy is low, as long as the requested pipeline runs.
-   - It's NOT OK if:
-     * code failed to execute (exceptions / tracebacks),
-     * task used the wrong dataset or library family (e.g. Iris instead of MNIST),
-     * key requested outputs were not printed.
+1. Decide if the MOST RECENT attempt **formally satisfies the task**,
+   ignoring model quality.
+   The attempt is ACCEPTABLE if and only if:
+   - The correct dataset / library family was used (e.g. MNIST vs Iris).
+   - The script executed without unhandled exceptions
+     (STATUS starts with "OK").
+   - The key requested outputs were clearly printed in STDOUT
+     (sum, accuracy, model path, etc.).
 
-2. If AND ONLY IF the latest attempt satisfies the task, you MUST:
-   - Call the `exit_loop` tool and do nothing else.
-   This signals the loop controller to stop early.
+   Low accuracy is acceptable as long as the pipeline matches the request.
 
-3. Otherwise (task not satisfied):
+2. If AND ONLY IF the latest attempt satisfies the task:
+   - You MUST call the `exit_loop` tool and say nothing else.
+   This stops the loop early.
+
+3. Otherwise (task NOT satisfied):
    - DO NOT call `exit_loop`.
-   - Instead, return a very short JSON-like critique into the output
-     (this will be stored as {STATE_FEEDBACK}), e.g.:
+   - Instead, respond with a very short JSON-like critique that will be
+     stored as {STATE_FEEDBACK}, for example:
 
      {{
        "status": "RETRY",
-       "reason": "...",
+       "reason": "The code failed with ModuleNotFoundError: joblib.",
        "hints": [
-         "Fix the import ...",
-         "Use the MNIST dataset from torchvision instead of Iris."
+         "Avoid installing packages inside the script.",
+         "Use an already installed library or rely on pickle instead."
        ]
      }}
 
 Constraints:
 
-- Your decision must be based ONLY on the task, code, stdout, and stderr.
-- Be conservative: if in doubt, do NOT approve.
-- Never talk about loop iterations or internal tools; just critique the code.
+- Base your decision ONLY on the task, the engineer's message,
+  and the run_python tool result.
+- Be conservative: if you are unsure, require another attempt.
+- Never mention loops, tools, or internal mechanics explicitly.
 """,
     output_key=STATE_FEEDBACK,
 )
 
-root_agent  = LoopAgent(
+
+# --- Root agent for ADK web / CLI -------------------------------------------
+
+root_agent = LoopAgent(
     name="EngineerLoop",
     sub_agents=[ml_engineer, judge],
     max_iterations=3,  # hard cap
