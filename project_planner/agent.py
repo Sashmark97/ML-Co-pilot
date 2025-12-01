@@ -1,3 +1,6 @@
+from ml_common.observability import init_agentops
+init_agentops(trace_name="project_planner")
+
 from google.adk.agents.llm_agent import Agent
 
 root_agent = Agent(

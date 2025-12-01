@@ -1,3 +1,6 @@
+from ml_common.observability import init_agentops
+init_agentops(trace_name="ml_engineer")
+
 STATE_FEEDBACK = "last_feedback"  # keep only what we actually use
 
 import io
