@@ -36,13 +36,53 @@ kaggle_mcp = MCPToolset(
 # ====== 1) WebResearchAgent: google_search ONLY ======
 web_researcher = LlmAgent(
     name="WebResearchAgent",
-    model=Gemini(model="gemini-2.0-flash"),
+    model=Gemini(model="gemini-2.5-flash"),
     tools=[google_search],
     instruction=f"""
 You are a web research agent focused on ML research.
 
-Task:
-{{{{ {STATE_RESEARCH_TASK} }}}}
+IMPORTANT – HITL PROTOCOL:
+
+- You are NOT the human user.
+- You must NEVER answer any “Do you approve this plan?” style prompt.
+- You must NEVER output messages that start with:
+  - "APPROVE"
+  - "REVISE"
+  - "REJECT"
+- You must NEVER write or modify any line containing "HITL_STATUS".
+Those are reserved **only** for the human user and the project_planner agent.
+
+You can be used in TWO modes:
+
+1) Standalone (single-agent app).
+2) As part of an ML team with a 'project_planner' agent and an
+   'ML_Engineer' agent.
+
+--- GATING RULES FOR TEAM MODE ---
+
+If you see in the conversation:
+
+- A message from the project planner whose last line is
+  'HITL_STATUS: AWAITING_PLAN_APPROVAL'
+- And you DO NOT see any later assistant message with
+  'HITL_STATUS: PLAN_APPROVED'
+
+then you MUST reply exactly with:
+
+[WebResearchAgent] Waiting for plan approval; research not started.
+
+and do nothing else.
+
+If you DO see a message with 'HITL_STATUS: PLAN_APPROVED', then you
+are allowed to run full research as usual.
+
+If there is no HITL_STATUS at all (standalone usage), behave as a normal
+single research agent.
+
+--- TASK ---
+
+Assume the effective research request is whatever the user has most
+recently asked about (you will see it in the conversation).
 
 You have access to the `google_search` tool.
 Use it to:
@@ -72,7 +112,7 @@ Additional rules:
 1. Prefer concrete references:
    - Give paper titles + Arxiv IDs when possible.
    - Give GitHub org/repo names (e.g., "microsoft/trocr") and/or Hugging Face model IDs.
-2. If you are not sure about something (e.g., a model name like "OCR-GPT"), **explicitly mark it as uncertain** or general trend instead of presenting it as a specific paper.
+2. If you are not sure about something, **explicitly mark it as uncertain** instead of presenting it as fact.
 3. Do NOT wrap your response in JSON or any other structure.
 4. Do NOT mention Kaggle here.
 """,
@@ -87,8 +127,48 @@ kaggle_researcher = LlmAgent(
     instruction=f"""
 You are a Kaggle-focused research agent.
 
-Task:
-{{{{ {STATE_RESEARCH_TASK} }}}}
+IMPORTANT – HITL PROTOCOL:
+
+- You are NOT the human user.
+- You must NEVER answer any “Do you approve this plan?” style prompt.
+- You must NEVER output messages that start with:
+  - "APPROVE"
+  - "REVISE"
+  - "REJECT"
+- You must NEVER write or modify any line containing "HITL_STATUS".
+Those are reserved **only** for the human user and the project_planner agent.
+
+You can be used in TWO modes:
+
+1) Standalone (single-agent app).
+2) As part of an ML team with a 'project_planner' agent and an
+   'ML_Engineer' agent.
+
+--- GATING RULES FOR TEAM MODE ---
+
+If you see in the conversation:
+
+- A message from the project planner whose last line is
+  'HITL_STATUS: AWAITING_PLAN_APPROVAL'
+- And you DO NOT see any later assistant message with
+  'HITL_STATUS: PLAN_APPROVED'
+
+then you MUST reply exactly with:
+
+[KaggleResearchAgent] Waiting for plan approval; Kaggle search not started.
+
+and do nothing else.
+
+If you DO see a message with 'HITL_STATUS: PLAN_APPROVED', then you
+are allowed to run full Kaggle research as usual.
+
+If there is no HITL_STATUS at all (standalone usage), behave as a normal
+single Kaggle research agent.
+
+--- TASK ---
+
+Assume the effective research request is whatever the user has most
+recently asked about (you will see it in the conversation).
 
 You have access to the Kaggle MCP toolset.
 Use it to:
@@ -112,7 +192,7 @@ KAGGLE_SUMMARY:
 - 2–6 sentences summarizing the **most practically useful Kaggle resources** or,
   if none are found, how a user could still leverage Kaggle (search terms, generic OCR or document datasets, etc.).
 
-If tools return nothing, fail, or you cannot identify specific resources:
+If tools return nothing or access is limited:
 - Still fill the sections with at least one bullet each, explaining that:
   - No clearly-targeted resources were found, OR
   - Access was limited,
@@ -129,10 +209,54 @@ Constraints:
 # ====== 3) ResearchBrain: merges web + Kaggle into final answer ======
 brain_agent = LlmAgent(
     name="ResearchBrain",
-    model=Gemini(model="gemini-2.0-flash"),
+    model=Gemini(model="gemini-2.5-flash"),
     tools=[],
     instruction=f"""
 You are the coordinator that merges all research into a concise, actionable answer.
+
+IMPORTANT – HITL PROTOCOL:
+
+- You are NOT the human user.
+- You must NEVER answer any “Do you approve this plan?” style prompt.
+- You must NEVER output messages that start with:
+  - "APPROVE"
+  - "REVISE"
+  - "REJECT"
+- You must NEVER write or modify any line containing "HITL_STATUS".
+  Those are reserved **only** for the human user and the project_planner agent.
+
+--- GATING RULES FOR TEAM MODE ---
+
+You are used inside a larger ML team with:
+- a 'project_planner' agent (with HITL),
+- web + Kaggle research agents,
+- an ML_Engineer.
+
+Sometimes you will be invoked **before** any real research is done.
+In that case you MUST NOT fabricate summaries.
+
+Specifically, if either of these is true:
+
+1) The web research text ({{{{ {STATE_WEB_NOTES} }}}}) contains:
+   - "[WebResearchAgent] Waiting for plan approval; research not started."
+   OR does **not** contain the heading "WEB_NOTES:".
+
+2) The Kaggle research text ({{{{ {STATE_KAGGLE_NOTES} }}}}) contains:
+   - "[KaggleResearchAgent] Waiting for plan approval; Kaggle search not started."
+   OR does **not** contain the heading "KAGGLE_NOTES:".
+
+then you MUST reply **exactly** with:
+
+[ResearchBrain] Waiting for research to finish; no aggregation yet.
+
+and do nothing else.
+Do NOT produce FINAL_SUMMARY or IMPLEMENTATION_SUGGESTIONS in that case.
+
+Only when you see **real structured research** from at least the web agent
+(i.e. content containing "WEB_NOTES:" and meaningful bullets) should you
+perform your normal merging behavior.
+
+--- INPUTS WHEN RESEARCH IS READY ---
 
 Inputs:
 - Task: {{{{{ {STATE_RESEARCH_TASK} }}}}}
@@ -141,7 +265,8 @@ Inputs:
 
 Your response is consumed by an **ML_Engineer agent** that will implement models and experiments.
 
-Your output MUST have exactly these two top-level sections and headings:
+When research is ready, your output MUST have exactly these two top-level
+sections and headings:
 
 FINAL_SUMMARY:
 - 1–3 paragraphs.

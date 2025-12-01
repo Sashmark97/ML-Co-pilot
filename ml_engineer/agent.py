@@ -12,38 +12,7 @@ from google.adk.models import Gemini
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.exit_loop_tool import exit_loop
 
-def run_python(code: str) -> str:
-    """
-    Execute arbitrary Python code in the current venv and return
-    status + captured stdout/stderr as a single string.
-
-    WARNING: This is intentionally unsafe, for local dev use only.
-    """
-    buf_out = io.StringIO()
-    buf_err = io.StringIO()
-    ns = {}
-    status = "OK"
-
-    try:
-        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-            compiled = compile(code, "<ml_engineer>", "exec")
-            exec(compiled, ns, ns)
-    except Exception as e:
-        status = f"ERROR: {type(e).__name__}: {e}"
-        traceback.print_exc(file=buf_err)
-
-    stdout = buf_out.getvalue()
-    stderr = buf_err.getvalue()
-
-    return (
-        f"STATUS: {status}\n\n"
-        f"STDOUT:\n{stdout}\n\n"
-        f"STDERR:\n{stderr}"
-    )
-
 # --- Local Python executor as a tool ----------------------------------------
-
-
 def run_python(code: str) -> str:
     """
     Execute arbitrary Python code in the current venv and return
@@ -72,19 +41,54 @@ def run_python(code: str) -> str:
         f"STDOUT:\n{stdout}\n\n"
         f"STDERR:\n{stderr}"
     )
-
 
 # --- ML Engineer agent ------------------------------------------------------
 
 
 ml_engineer = LlmAgent(
     name="ML_Engineer",
-    model=Gemini(model="gemini-2.5-flash-lite"),
-    # ADK in your version accepts plain callables as tools
+    model=Gemini(model="gemini-2.5-flash"),
     tools=[run_python],
     instruction=f"""
 You are an ML Engineer. Your job is to implement and run Python code
 for a single task.
+
+IMPORTANT – HITL PROTOCOL:
+
+- You are NOT the human user.
+- You must NEVER answer any “Do you approve this plan?” style prompt.
+- You must NEVER output messages that start with:
+  - "APPROVE"
+  - "REVISE"
+  - "REJECT"
+- You must NEVER write or modify any line containing "HITL_STATUS".
+  Those are reserved **only** for the human user and the project_planner agent.
+
+--- GATING RULES FOR TEAM MODE ---
+
+You are used inside an ML team with:
+- a 'project_planner' (HITL),
+- research agents (web + Kaggle),
+- a 'ResearchBrain' aggregator.
+
+Sometimes you will be invoked **before** there is a real plan / research
+summary for you to implement.
+
+You must **NOT** write or run code unless BOTH are true:
+
+1) You see a message from ResearchBrain that contains a proper
+   "FINAL_SUMMARY:" section (not just a waiting marker).
+
+2) That message does NOT contain the line:
+   "[ResearchBrain] Waiting for research to finish; no aggregation yet."
+
+If these conditions are NOT met, you MUST reply exactly with:
+
+[ML_Engineer] Waiting for finalized research/plan; no code executed.
+
+and you MUST NOT call the `run_python` tool in that case.
+
+--- NORMAL BEHAVIOR WHEN PLAN IS READY ---
 
 Task description (from the user):
 {{+ user_input +}}
@@ -120,7 +124,6 @@ You MUST NOT:
 - Start unrelated experiments or train many different models.
 - Download large datasets or train huge networks.
 """,
-    # We'll stash your human-readable summary for the judge to reuse as feedback
     output_key=STATE_FEEDBACK,
 )
 
@@ -130,10 +133,62 @@ You MUST NOT:
 
 judge = LlmAgent(
     name="EngineerJudge",
-    model=Gemini(model="gemini-2.5-flash-lite"),
+    model=Gemini(model="gemini-2.5-flash"),  # keep this as flash, NOT lite
     tools=[FunctionTool(exit_loop)],
     instruction=f"""
 You are a strict judge for an ML coding task.
+
+IMPORTANT – HITL PROTOCOL:
+
+- You are NOT the human user.
+- You must NEVER answer any “Do you approve this plan?” style prompt.
+- You must NEVER output messages that start with:
+  - "APPROVE"
+  - "REVISE"
+  - "REJECT"
+- You must NEVER write or modify any line containing "HITL_STATUS".
+  Those are reserved **only** for the human user and the project_planner agent.
+
+IMPORTANT – WHEN YOU MUST **NOT** EXIT:
+
+You are used inside an ML engineering loop with an `ML_Engineer` agent
+and a `run_python` tool.
+
+Sometimes the engineer will respond with a WAITING message and **no**
+code execution. In those situations you must NOT treat the task as done.
+
+If ANY of the following are true:
+
+1) The engineer's latest message contains the line:
+   "[ML_Engineer] Waiting for finalized research/plan; no code executed."
+   (or a very similar waiting message).
+
+2) There is NO `run_python` tool result in the context:
+   - i.e. you do not see a block starting with
+     "STATUS:" followed by "STDOUT:" and "STDERR:".
+
+then you MUST:
+
+- NOT call `exit_loop`.
+- Instead, respond with a very short JSON-like feedback, e.g.:
+
+  {{
+    "status": "WAITING",
+    "reason": "No code was executed yet. The engineer is still waiting for a finalized plan or research.",
+    "hints": [
+      "Wait for the project planner to finalize the plan and approve it.",
+      "Only judge actual code runs that used run_python."
+    ]
+  }}
+
+This will be stored as {STATE_FEEDBACK} and used by the engineer later.
+
+Only when actual code has been executed (with a run_python result) should
+you consider calling `exit_loop`.
+
+---
+
+NORMAL EVALUATION BEHAVIOR (WHEN CODE HAS RUN)
 
 Available context:
 - Task description: {{+ user_input +}}
@@ -145,20 +200,33 @@ Your job:
 
 1. Decide if the MOST RECENT attempt **formally satisfies the task**,
    ignoring model quality.
-   The attempt is ACCEPTABLE if and only if:
-   - The correct dataset / library family was used (e.g. MNIST vs Iris).
-   - The script executed without unhandled exceptions
-     (STATUS starts with "OK").
+
+   The attempt is ACCEPTABLE if and only if ALL of the following hold:
+
+   - The script was actually executed via `run_python` and you see
+     a tool result with lines like:
+       "STATUS: OK"
+       "STDOUT:"
+       "STDERR:"
+
+   - The correct dataset / library family was used
+     (e.g. Iris when the task is about Iris, MNIST when the task is about MNIST).
+
+   - The STATUS starts with "OK" (no unhandled exceptions / tracebacks).
+
    - The key requested outputs were clearly printed in STDOUT
-     (sum, accuracy, model path, etc.).
+     (sum, accuracy, F1, model path, etc. as requested by the task).
 
-   Low accuracy is acceptable as long as the pipeline matches the request.
+   Low accuracy is acceptable as long as the pipeline and dataset
+   match the request.
 
-2. If AND ONLY IF the latest attempt satisfies the task:
+2. If AND ONLY IF the latest attempt satisfies the task as above:
+
    - You MUST call the `exit_loop` tool and say nothing else.
-   This stops the loop early.
+     This stops the engineering loop early because the task is done.
 
 3. Otherwise (task NOT satisfied):
+
    - DO NOT call `exit_loop`.
    - Instead, respond with a very short JSON-like critique that will be
      stored as {STATE_FEEDBACK}, for example:
@@ -174,9 +242,14 @@ Your job:
 
 Constraints:
 
-- Base your decision ONLY on the task, the engineer's message,
-  and the run_python tool result.
-- Be conservative: if you are unsure, require another attempt.
+- Base your decision ONLY on:
+  - the task,
+  - the engineer's latest message,
+  - and the `run_python` tool result (if any).
+
+- Be conservative: if you are unsure whether the task is formally done,
+  **do NOT approve** and do NOT call `exit_loop`.
+
 - Never mention loops, tools, or internal mechanics explicitly.
 """,
     output_key=STATE_FEEDBACK,
